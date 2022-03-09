@@ -1,5 +1,9 @@
+pub mod player;
+pub mod socket;
+
 use std::str::from_utf8;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,23 +25,17 @@ struct GETGameListGameInfo {
     g: u8,     // Mode
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GETGameInfo {
-    host: String,
-    #[serde(rename = "clientId")]
-    client_id: String,
-}
-
 #[derive(Debug, Clone)]
 pub struct Client {
-    client_key: String,
+    pub(crate) prime: u16,
+    pub(crate) client_key: String,
 }
 
 impl Client {
-    pub async fn new() -> Result<Client, Box<dyn std::error::Error>> {
+    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let req_client = reqwest::Client::new();
 
-        // TODO: get key on the client
+        //TODO: get key on the client
         let client_key: String = req_client
             .get("https://api.sys32.dev/v3/key")
             .send()
@@ -45,12 +43,31 @@ impl Client {
             .text()
             .await?;
 
-        Ok(Client { client_key })
+        // Get the source to extract the prime number for rotating the padding bytes
+        // TODO: See if there is a way to get it without the source
+        let source: String = req_client
+            .get("https://api.sys32.dev/v3/source")
+            .send()
+            .await?
+            .text()
+            .await?;
+
+        let prime = Regex::new(r"JSON\.parse\('(\d+)'\)")?
+            .captures(&source)
+            .expect("Could not extract prime number from source code")
+            .get(1)
+            .expect("Could not extract prime number from source code")
+            .as_str()
+            .parse::<u16>()?;
+
+        println!("{}", prime);
+
+        Ok(Self { prime, client_key })
     }
 
     pub async fn games(&self) -> Result<Vec<Game>, Box<dyn std::error::Error>> {
-        let client = reqwest::Client::new();
-        let games: GETGameList = client
+        let req_client = reqwest::Client::new();
+        let games: GETGameList = req_client
             .get("https://matchmaker.krunker.io/game-list")
             .query(&[("hostname", "krunker.io")])
             .send()
@@ -91,6 +108,15 @@ pub struct Game {
     pub mode: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameInfo {
+    pub host: String,
+    #[serde(rename = "clientId")]
+    pub client_id: String,
+    #[serde(rename = "gameId")]
+    pub game_id: String,
+}
+
 impl Game {
     pub async fn generate_token(&self) -> Result<String, Box<dyn std::error::Error>> {
         let req_client = reqwest::Client::new();
@@ -115,9 +141,9 @@ impl Game {
         Ok(from_utf8(&hashed_token)?.to_string())
     }
 
-    pub async fn generate_uri(&self) -> Result<String, Box<dyn std::error::Error>> {
-        let client = reqwest::Client::new();
-        let game_info: GETGameInfo = client
+    pub async fn game_info(&self) -> Result<GameInfo, Box<dyn std::error::Error>> {
+        let req_client = reqwest::Client::new();
+        let game_info: GameInfo = req_client
             .get("https://matchmaker.krunker.io/seek-game")
             .header("Origin", "https://krunker.io")
             .query(&[
@@ -133,9 +159,6 @@ impl Game {
             .json()
             .await?;
 
-        Ok(format!(
-            "wss://{}/ws?gameId={}&clientKey={}",
-            game_info.host, self.id, game_info.client_id
-        ))
+        Ok(game_info)
     }
 }

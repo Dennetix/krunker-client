@@ -1,9 +1,13 @@
-use krunker_client::Client;
+use krunker_client::{player::Player, Client};
 
 #[tokio::main]
 async fn main() {
-    let games = Client::new().await.unwrap().games().await.unwrap();
+    let client = Client::new().await.unwrap();
+    let games = client.games().await.unwrap();
     let game = games.get(0).unwrap();
 
-    println!("{:?}", game.generate_uri().await)
+    Player::new(&client)
+        .join(&game.game_info().await.unwrap())
+        .await
+        .unwrap();
 }

@@ -21,7 +21,7 @@ struct GETGameList {
 struct GETGameListGameInfo {
     c: u8,     // 1 if custom game
     v: String, // Version
-    i: String, // Map name,
+    i: String, // Map name
     g: u8,     // Mode
 }
 
@@ -35,34 +35,42 @@ impl Client {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let req_client = reqwest::Client::new();
 
-        //TODO: get key on the client
-        let client_key: String = req_client
-            .get("https://api.sys32.dev/v3/key")
-            .send()
-            .await?
-            .text()
-            .await?;
-
-        // Get the source to extract the prime number for rotating the padding bytes
-        // TODO: See if there is a way to get it without the source
-        let source: String = req_client
-            .get("https://api.sys32.dev/v3/source")
-            .send()
-            .await?
-            .text()
-            .await?;
+        let (source, client_key) = tokio::join!(
+            async {
+                //TODO: get key on the client
+                req_client
+                    .get("https://api.sys32.dev/v3/source")
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+            },
+            async {
+                // Get the source to extract the prime number for rotating the padding bytes
+                // TODO: See if there is a way to get it without the source
+                req_client
+                    .get("https://api.sys32.dev/v3/key")
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+            }
+        );
 
         let prime = Regex::new(r"JSON\.parse\('(\d+)'\)")?
-            .captures(&source)
+            .captures(&source?)
             .expect("Could not extract prime number from source code")
             .get(1)
             .expect("Could not extract prime number from source code")
             .as_str()
             .parse::<u16>()?;
 
-        println!("{}", prime);
-
-        Ok(Self { prime, client_key })
+        Ok(Self {
+            prime,
+            client_key: client_key?,
+        })
     }
 
     pub async fn games(&self) -> Result<Vec<Game>, Box<dyn std::error::Error>> {

@@ -1,8 +1,8 @@
-use std::pin::Pin;
+use std::sync::Arc;
 
-use futures_util::{stream::SplitSink, SinkExt, Stream, StreamExt};
+use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use serde::Serialize;
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, sync::Mutex};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
@@ -18,12 +18,13 @@ type WSSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
 pub enum SocketMessage {
     Message(String, Vec<serde_json::Value>),
-    Error(Box<dyn std::error::Error>),
+    Error(Box<dyn std::error::Error + Sync + Send>),
     Close,
 }
 
 pub struct Socket {
     ws_write: Option<WSSink>,
+    messages: Arc<Mutex<Vec<SocketMessage>>>,
     prime: u16,
     num: u16,
 }
@@ -32,6 +33,7 @@ impl Socket {
     pub fn new(client: &Client) -> Self {
         Self {
             ws_write: None,
+            messages: Arc::new(Mutex::new(vec![])),
             prime: client.prime,
             num: 0,
         }
@@ -40,9 +42,7 @@ impl Socket {
     pub async fn connect(
         &mut self,
         game_info: &GameInfo,
-    ) -> Result<Pin<Box<dyn Stream<Item = SocketMessage> + Send>>, Box<dyn std::error::Error>> {
-        self.num = 0;
-
+    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
         let req = Request::builder()
             .header("Host", game_info.host.clone())
             .header("Connection", "Upgrade")
@@ -60,24 +60,34 @@ impl Socket {
         let (ws_write, ws_read) = ws_stream.split();
 
         self.ws_write = Some(ws_write);
+        self.num = 0;
 
-        let decoded_read = ws_read
-            .map(|msg| match msg {
-                Ok(msg) => match msg {
-                    Message::Binary(msg) => match Self::decode_message(&msg) {
-                        Ok(decoded) => SocketMessage::Message(decoded.0, decoded.1),
-                        Err(err) => SocketMessage::Error(err),
-                    },
-                    Message::Close(_) => SocketMessage::Close,
-                    _ => SocketMessage::Error(
-                        "Received unexpected non binary or close message.".into(),
-                    ),
-                },
-                Err(err) => SocketMessage::Error(err.into()),
-            })
-            .boxed();
+        let messages = self.messages.clone();
+        messages.lock().await.clear();
+        tokio::spawn(async move {
+            ws_read
+                .for_each(|msg| async {
+                    match msg {
+                        Ok(msg) => match msg {
+                            Message::Binary(msg) => match Self::decode_message(&msg) {
+                                Ok(decoded) => messages
+                                    .lock()
+                                    .await
+                                    .push(SocketMessage::Message(decoded.0, decoded.1)),
+                                Err(err) => messages.lock().await.push(SocketMessage::Error(err)),
+                            },
+                            Message::Close(_) => messages.lock().await.push(SocketMessage::Close),
+                            _ => messages.lock().await.push(SocketMessage::Error(
+                                "Received unexpected non binary or close message.".into(),
+                            )),
+                        },
+                        Err(err) => messages.lock().await.push(SocketMessage::Error(err.into())),
+                    }
+                })
+                .await;
+        });
 
-        Ok(decoded_read)
+        Ok(())
     }
 
     pub async fn send<D>(&mut self, msg: &D) -> Result<(), Box<dyn std::error::Error>>
@@ -95,6 +105,22 @@ impl Socket {
         }
 
         Ok(())
+    }
+
+    pub async fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(ws_write) = self.ws_write.as_mut() {
+            ws_write.close().await?;
+            self.ws_write = None;
+        }
+        Ok(())
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.ws_write.is_some()
+    }
+
+    pub async fn get_messages(&mut self) -> Vec<SocketMessage> {
+        self.messages.lock().await.drain(..).collect()
     }
 
     pub fn encode_message<S>(&mut self, msg: &S) -> Result<Vec<u8>, Box<dyn std::error::Error>>

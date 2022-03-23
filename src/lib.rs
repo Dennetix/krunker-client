@@ -1,3 +1,4 @@
+pub mod messages;
 pub mod player;
 pub mod socket;
 
@@ -32,7 +33,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new() -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
         let req_client = reqwest::Client::new();
 
         let (source, client_key) = tokio::join!(
@@ -73,7 +74,7 @@ impl Client {
         })
     }
 
-    pub async fn games(&self) -> Result<Vec<Game>, Box<dyn std::error::Error>> {
+    pub async fn games(&self) -> Result<Vec<Game>, Box<dyn std::error::Error + Sync + Send>> {
         let req_client = reqwest::Client::new();
         let games: GETGameList = req_client
             .get("https://matchmaker.krunker.io/game-list")
@@ -126,7 +127,7 @@ pub struct GameInfo {
 }
 
 impl Game {
-    pub async fn generate_token(&self) -> Result<String, Box<dyn std::error::Error>> {
+    pub async fn generate_token(&self) -> Result<String, Box<dyn std::error::Error + Sync + Send>> {
         let req_client = reqwest::Client::new();
 
         let token: serde_json::Value = req_client
@@ -138,7 +139,7 @@ impl Game {
             .await?;
 
         // TODO: hash the token on the client
-        let hashed_token: Vec<u8> = req_client
+        let token_hash: Vec<u8> = req_client
             .post("https://api.sys32.dev/v3/token")
             .json(&serde_json::json!(token))
             .send()
@@ -146,10 +147,10 @@ impl Game {
             .json()
             .await?;
 
-        Ok(from_utf8(&hashed_token)?.to_string())
+        Ok(from_utf8(&token_hash)?.to_string())
     }
 
-    pub async fn game_info(&self) -> Result<GameInfo, Box<dyn std::error::Error>> {
+    pub async fn game_info(&self) -> Result<GameInfo, Box<dyn std::error::Error + Sync + Send>> {
         let req_client = reqwest::Client::new();
         let game_info: GameInfo = req_client
             .get("https://matchmaker.krunker.io/seek-game")

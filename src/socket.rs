@@ -12,10 +12,11 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 
-use crate::{Client, GameInfo};
+use crate::{Client, Game};
 
 type WSSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
+#[derive(Debug)]
 pub enum SocketMessage {
     Message(String, Vec<serde_json::Value>),
     Error(Box<dyn std::error::Error + Sync + Send>),
@@ -41,8 +42,10 @@ impl Socket {
 
     pub async fn connect(
         &mut self,
-        game_info: &GameInfo,
+        game: &Game,
     ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+        let game_info = game.game_info().await?;
+
         let req = Request::builder()
             .header("Host", game_info.host.clone())
             .header("Connection", "Upgrade")
@@ -90,24 +93,21 @@ impl Socket {
         Ok(())
     }
 
-    pub async fn send<D>(&mut self, msg: &D) -> Result<(), Box<dyn std::error::Error>>
-    where
-        D: Serialize + std::fmt::Debug,
-    {
-        if self.ws_write.is_some() {
-            println!("{:?}", msg);
-            let msg = self.encode_message(msg)?;
-            self.ws_write
-                .as_mut()
-                .unwrap()
-                .send(Message::Binary(msg))
-                .await?;
-        }
+    pub async fn send<S: Serialize>(
+        &mut self,
+        msg: &S,
+    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+        let msg = self.encode_message(msg)?;
+        self.ws_write
+            .as_mut()
+            .ok_or("Socket not open")?
+            .send(Message::Binary(msg))
+            .await?;
 
         Ok(())
     }
 
-    pub async fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn close(&mut self) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
         if let Some(ws_write) = self.ws_write.as_mut() {
             ws_write.close().await?;
             self.ws_write = None;
@@ -123,10 +123,10 @@ impl Socket {
         self.messages.lock().await.drain(..).collect()
     }
 
-    pub fn encode_message<S>(&mut self, msg: &S) -> Result<Vec<u8>, Box<dyn std::error::Error>>
-    where
-        S: Serialize,
-    {
+    pub fn encode_message<S: Serialize>(
+        &mut self,
+        msg: &S,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Sync + Send>> {
         // Encode the actual data with msgpack
         let mut encoded = rmp_serde::encode::to_vec(msg)?;
 

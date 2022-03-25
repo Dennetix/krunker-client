@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::VecDeque, f32::consts::PI, sync::Arc, time::Duration};
 
 use tokio::{sync::Mutex, time};
 
@@ -14,11 +14,31 @@ pub struct Account {
     pub password: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Position {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+impl Position {
+    fn max_diff_xz(&self, other: &Position, max_diff: f32) -> bool {
+        (self.x - other.x).abs() <= max_diff && (self.z - other.z).abs() <= max_diff
+    }
+}
+
+#[derive(Debug)]
+struct State {
+    tick: u32,
+    position: Position,
+    rotation: f32,
+    walking: bool,
+}
+
 pub struct PlayerBuilder<'a> {
     client: &'a Client,
     tick_interval: Duration,
     account: Option<Account>,
-    class: u16,
 }
 
 impl<'a> PlayerBuilder<'a> {
@@ -27,7 +47,6 @@ impl<'a> PlayerBuilder<'a> {
             client,
             tick_interval: Duration::from_millis(66),
             account: None,
-            class: 0,
         }
     }
 
@@ -41,11 +60,6 @@ impl<'a> PlayerBuilder<'a> {
         self
     }
 
-    pub fn class(mut self, class: u16) -> Self {
-        self.class = class;
-        self
-    }
-
     pub async fn connect(
         &self,
         game: &Game,
@@ -55,16 +69,20 @@ impl<'a> PlayerBuilder<'a> {
 
         let player = Arc::new(Mutex::new(Player {
             socket,
-            num_tick: 0,
+            tick: 0,
             tick_interval: self.tick_interval,
             account: self.account.clone(),
-            class: self.class,
             id: None,
             ready: false,
             in_game: false,
             walking: false,
-            position: (0.0, 0.0),
+            position: Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
             rotation: 0.0,
+            state_buffer: VecDeque::new(),
         }));
 
         Player::run_tick(player.clone());
@@ -73,26 +91,28 @@ impl<'a> PlayerBuilder<'a> {
     }
 }
 
+const MOVEMENT_SPEED: f32 = 0.0000459;
+
 pub struct Player {
     socket: Socket,
-    num_tick: u32,
+    tick: u32,
 
     tick_interval: Duration,
     account: Option<Account>,
-    class: u16,
 
     id: Option<String>,
     ready: bool,
     in_game: bool,
     walking: bool,
-    position: (f32, f32),
+    position: Position,
     rotation: f32,
+    state_buffer: VecDeque<State>,
 }
 
 impl Player {
     pub async fn enter(&mut self) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
         if !self.in_game {
-            self.socket.send(&MessageBuilder::enter(self.class)).await?;
+            self.socket.send(&MessageBuilder::enter()).await?;
             Ok(())
         } else {
             Err("Player already in game".into())
@@ -107,13 +127,13 @@ impl Player {
             self.walking = state;
             self.socket
                 .send(&MessageBuilder::tick(
-                    self.num_tick,
+                    self.tick,
                     &self.tick_interval,
                     None,
                     Some(format!("{{\"0-4\": {}}}", if state { 1 } else { -1 })),
                 )?)
                 .await?;
-            self.num_tick += 1;
+            self.tick += 1;
             Ok(())
         } else {
             Err("Player not in game".into())
@@ -127,7 +147,7 @@ impl Player {
         if self.in_game {
             self.socket
                 .send(&MessageBuilder::tick(
-                    self.num_tick,
+                    self.tick,
                     &self.tick_interval,
                     None,
                     Some(format!(
@@ -136,39 +156,24 @@ impl Player {
                     )),
                 )?)
                 .await?;
-            self.num_tick += 1;
+            self.tick += 1;
             Ok(())
         } else {
             Err("Player not in game".into())
         }
     }
 
-    pub async fn rotation(
-        &mut self,
-        rotation: f32,
-    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-        if self.in_game {
-            self.rotation = rotation;
-            self.socket
-                .send(&MessageBuilder::tick(
-                    self.num_tick,
-                    &self.tick_interval,
-                    Some(self.rotation),
-                    None,
-                )?)
-                .await?;
-            self.num_tick += 1;
-            Ok(())
-        } else {
-            Err("Player not in game".into())
+    pub fn rotation(&mut self, rotation: f32) {
+        self.rotation = rotation;
+        if self.rotation > 2.0 * PI {
+            self.rotation = self.rotation - 2.0 * PI;
+        } else if self.rotation < 0.0 {
+            self.rotation = 2.0 * PI + self.rotation;
         }
     }
 
-    pub async fn rotate(
-        &mut self,
-        rotation: f32,
-    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-        self.rotation(self.rotation + rotation).await
+    pub fn rotate(&mut self, rotation: f32) {
+        self.rotation(self.rotation + rotation);
     }
 
     pub fn in_game(&self) -> bool {
@@ -206,19 +211,26 @@ impl Player {
     async fn tick(&mut self) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
         self.socket
             .send(&MessageBuilder::tick(
-                self.num_tick,
+                self.tick,
                 &self.tick_interval,
-                None,
+                Some(self.rotation),
                 None,
             )?)
             .await?;
-        self.num_tick += 1;
+        self.tick += 1;
 
         if self.walking {
-            let dist = self.tick_interval.as_micros() as f32 * 0.000045;
-            self.position.0 += dist * self.rotation.sin();
-            self.position.1 += dist * -self.rotation.cos();
+            let dist = self.tick_interval.as_micros() as f32 * MOVEMENT_SPEED;
+            self.position.x += dist * self.rotation.sin();
+            self.position.z += dist * -self.rotation.cos();
         }
+
+        self.state_buffer.push_back(State {
+            tick: self.tick,
+            position: self.position,
+            rotation: self.rotation,
+            walking: self.walking,
+        });
 
         Ok(())
     }
@@ -258,25 +270,44 @@ impl Player {
             }
             // spawn in game
             "0" => {
-                self.in_game = true;
-                self.walking = false;
-                self.position =
-                    MessageParser::spawn_position(&msg, &self.id.as_ref().ok_or("Id not set")?)?;
+                if let Some(spawn_position) =
+                    MessageParser::spawn_position(&msg, &self.id.as_ref().ok_or("Id not set")?)?
+                {
+                    self.in_game = true;
+                    self.walking = false;
+                    self.position = spawn_position;
 
-                self.socket.send(&MessageBuilder::init_tick()).await?;
-                self.num_tick = 1;
+                    self.socket.send(&MessageBuilder::init_tick()).await?;
+                    self.tick = 1;
+                }
             }
             // player update
             "l" => {
-                let (is_dead, position) = MessageParser::player_update(&msg)?;
+                let (is_dead, state) = MessageParser::player_update(&msg)?;
                 if is_dead {
                     self.in_game = false;
                     tokio::time::sleep(Duration::from_secs(3)).await;
                     self.enter().await?;
                 } else {
-                    if let Some(position) = position {
-                        println!("{}\t{}", position.1, self.position.1);
-                        self.position = position;
+                    if let Some((tick, position)) = state {
+                        self.state_buffer.retain(|s| s.tick >= tick);
+
+                        if let Some(past_state) = self.state_buffer.front() {
+                            // Reconciliate the position if there is too much difference between the states
+                            if !position.max_diff_xz(&past_state.position, 0.5) {
+                                self.position = position;
+                                for state in self.state_buffer.iter_mut() {
+                                    if state.walking {
+                                        let dist =
+                                            self.tick_interval.as_micros() as f32 * MOVEMENT_SPEED;
+                                        self.position.x += dist * state.rotation.sin();
+                                        self.position.z += dist * -state.rotation.cos();
+                                    }
+
+                                    state.position = self.position;
+                                }
+                            }
+                        }
                     } else {
                         return Err("Didn't receive position on player update".into());
                     }

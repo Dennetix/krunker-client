@@ -10,29 +10,45 @@ async fn main() {
         .await
         .unwrap()
         .into_iter()
-        .filter(|g| g.players == 0 && !g.custom && g.map == "Kanji")
+        .filter(|g| {
+            g.players == 0
+                && !g.custom
+                && g.map == "Industry"
+                && g.mode == "0"
+                && g.region == "de-fra"
+        })
         .collect();
 
-    let game = games.get(1).unwrap();
+    let game = games.get(0).unwrap();
 
     println!("{}", game.id);
 
     let players = vec![PlayerBuilder::new(&client).connect(&game).await.unwrap()];
 
-    loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        for player in players.iter() {
-            let mut lock = player.lock().await;
-            if lock.in_game() {
-                lock.rotate(PI).await.unwrap();
-                lock.walk(true).await.unwrap();
-            }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for player in players.iter() {
+        let mut lock = player.lock().await;
+        if lock.in_game() {
+            lock.rotate(PI);
         }
-        tokio::time::sleep(Duration::from_secs(4)).await;
+    }
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    for player in players.iter() {
+        let mut lock = player.lock().await;
+        if lock.in_game() {
+            lock.walk(true).await.unwrap();
+        }
+    }
+
+    tokio::time::sleep(Duration::from_secs_f32(1.25)).await;
+
+    loop {
+        tokio::time::sleep(Duration::from_millis(66)).await;
         for player in players.iter() {
             let mut lock = player.lock().await;
             if lock.in_game() {
-                lock.walk(false).await.unwrap();
+                lock.rotate(0.15);
             }
         }
     }

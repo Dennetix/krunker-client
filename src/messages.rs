@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::player::Account;
+use crate::player::{Account, Position};
 
 pub struct MessageBuilder;
 
@@ -19,11 +19,11 @@ impl MessageBuilder {
         json!(["a", 1, [account.username, account.password, ()], ()])
     }
 
-    pub fn enter(class: u16) -> Value {
+    pub fn enter() -> Value {
         json!([
             "en",
             [
-                class,
+                0,
                 2482,
                 [-1, -1],
                 -1,
@@ -107,41 +107,47 @@ impl MessageParser {
     pub fn spawn_position(
         msg: &Vec<Value>,
         id: &str,
-    ) -> Result<(f32, f32), Box<dyn std::error::Error + Sync + Send>> {
+    ) -> Result<Option<Position>, Box<dyn std::error::Error + Sync + Send>> {
         let positions = msg
             .first()
             .ok_or("Wrong Message Type")?
             .as_array()
             .ok_or("Wrong Message Type")?;
 
-        let id_index = positions
-            .iter()
-            .position(|p| {
-                if let Some(p) = p.as_str() {
-                    p == id
-                } else {
-                    false
-                }
-            })
-            .ok_or("Could not find id in spawn message")?;
+        let id_index = positions.iter().position(|p| {
+            if let Some(p) = p.as_str() {
+                p == id
+            } else {
+                false
+            }
+        });
 
-        Ok((
-            positions
-                .get(id_index + 2)
-                .ok_or("Wrong Message Type")?
-                .as_f64()
-                .ok_or("Position has wrong type")? as f32,
-            positions
-                .get(id_index + 4)
-                .ok_or("Wrong Message Type")?
-                .as_f64()
-                .ok_or("Position has wrong type")? as f32,
-        ))
+        if let Some(id_index) = id_index {
+            Ok(Some(Position {
+                x: positions
+                    .get(id_index + 2)
+                    .ok_or("Wrong Message Type")?
+                    .as_f64()
+                    .ok_or("Position x has wrong type")? as f32,
+                y: positions
+                    .get(id_index + 3)
+                    .ok_or("Wrong Message Type")?
+                    .as_f64()
+                    .ok_or("Position y has wrong type")? as f32,
+                z: positions
+                    .get(id_index + 4)
+                    .ok_or("Wrong Message Type")?
+                    .as_f64()
+                    .ok_or("Position z has wrong type")? as f32,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn player_update(
         msg: &Vec<Value>,
-    ) -> Result<(bool, Option<(f32, f32)>), Box<dyn std::error::Error + Sync + Send>> {
+    ) -> Result<(bool, Option<(u32, Position)>), Box<dyn std::error::Error + Sync + Send>> {
         let first = msg.first().ok_or("Wrong Message Type")?;
 
         if let Some(first) = first.as_i64() {
@@ -155,15 +161,27 @@ impl MessageParser {
                 false,
                 Some((
                     first
-                        .get(2)
+                        .get(0)
                         .ok_or("Wrong Message Type")?
-                        .as_f64()
-                        .ok_or("Position has wrong type")? as f32,
-                    first
-                        .get(4)
-                        .ok_or("Wrong Message Type")?
-                        .as_f64()
-                        .ok_or("Position has wrong type")? as f32,
+                        .as_i64()
+                        .ok_or("Tick has wrong type")? as u32,
+                    Position {
+                        x: first
+                            .get(2)
+                            .ok_or("Wrong Message Type")?
+                            .as_f64()
+                            .ok_or("Position x has wrong type")? as f32,
+                        y: first
+                            .get(3)
+                            .ok_or("Wrong Message Type")?
+                            .as_f64()
+                            .ok_or("Position y has wrong type")? as f32,
+                        z: first
+                            .get(4)
+                            .ok_or("Wrong Message Type")?
+                            .as_f64()
+                            .ok_or("Position z has wrong type")? as f32,
+                    },
                 )),
             ))
         } else {

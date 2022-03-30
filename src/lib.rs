@@ -1,11 +1,15 @@
+pub mod map;
 pub mod messages;
 pub mod player;
 pub mod socket;
+pub mod utils;
 
 use std::str::from_utf8;
 
+use map::Map;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GETGameList {
@@ -30,6 +34,7 @@ struct GETGameListGameInfo {
 pub struct Client {
     pub(crate) prime: u16,
     pub(crate) client_key: String,
+    maps: Vec<Map>,
 }
 
 impl Client {
@@ -60,17 +65,38 @@ impl Client {
             }
         );
 
+        let source = source?;
+
         let prime = Regex::new(r"JSON\.parse\('(\d+)'\)")?
-            .captures(&source?)
-            .expect("Could not extract prime number from source code")
+            .captures(&source)
+            .ok_or("Could not extract prime number from source code")?
             .get(1)
-            .expect("Could not extract prime number from source code")
+            .ok_or("Could not extract prime number from source code")?
             .as_str()
             .parse::<u16>()?;
+
+        let mut map_counter = -1;
+        let tasks = Regex::new(r#"\{"name":"[^"]+",[^']+"#)?
+            .find_iter(&source)
+            .skip(1)
+            .map(|m| {
+                map_counter += 1;
+                let map_json = m.as_str().to_owned();
+                tokio::spawn(async move { Map::new(map_counter as u32, &map_json) })
+            })
+            .collect::<Vec<JoinHandle<Result<Map, Box<dyn std::error::Error + Sync + Send>>>>>();
+
+        println!("Loading {} maps", map_counter + 1);
+
+        let mut maps = Vec::<Map>::with_capacity(map_counter as usize + 1);
+        for task in tasks {
+            maps.push(task.await??);
+        }
 
         Ok(Self {
             prime,
             client_key: client_key?,
+            maps,
         })
     }
 
@@ -93,7 +119,7 @@ impl Client {
                 region: game.1.clone(),
                 players: game.2,
                 max_players: game.3,
-                custom: if game.4.c == 0 { false } else { true },
+                custom: game.4.c != 0,
                 version: game.4.v.clone(),
                 map: game.4.i.clone(),
                 mode: game.4.g.to_string(), // TODO: actually convert into mode name
@@ -101,6 +127,18 @@ impl Client {
             .collect();
 
         Ok(games)
+    }
+
+    pub fn map(&self, id: Option<u32>, name: Option<&str>) -> Option<&Map> {
+        self.maps.iter().find(|map| {
+            if let Some(id) = id {
+                map.id == id
+            } else if let Some(name) = name {
+                map.name == name
+            } else {
+                false
+            }
+        })
     }
 }
 

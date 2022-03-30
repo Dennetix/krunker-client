@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::player::{Account, Position};
+use crate::{player::Account, utils::Vec3};
 
 pub struct MessageBuilder;
 
@@ -68,7 +68,7 @@ impl MessageBuilder {
         state_str: Option<String>,
     ) -> Result<Value, Box<dyn std::error::Error + Sync + Send>> {
         let rotation = if let Some(rotation) = rotation {
-            json!([0 as i32, (rotation * -1000.0).round() as i32])
+            json!([0, (rotation * -1000.0).round() as i32])
         } else {
             json!(())
         };
@@ -82,20 +82,27 @@ impl MessageBuilder {
         let dt = ((tick_interval.as_micros() as f32 / 10.0).round() as i32).min(3333);
         Ok(json!([
             "q",
-            0 as i32,
+            0,
             num_tick,
             dt.to_string(),
-            2 as i32,
+            2,
             rotation,
             state
         ]))
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PlayerState {
+    pub is_dead: bool,
+    pub tick: Option<u32>,
+    pub position: Option<Vec3>,
+}
+
 pub struct MessageParser;
 
 impl MessageParser {
-    pub fn io_init(msg: &Vec<Value>) -> Result<String, Box<dyn std::error::Error + Sync + Send>> {
+    pub fn io_init(msg: &[Value]) -> Result<String, Box<dyn std::error::Error + Sync + Send>> {
         Ok(msg
             .first()
             .ok_or("Wrong Message Type")?
@@ -105,9 +112,9 @@ impl MessageParser {
     }
 
     pub fn spawn_position(
-        msg: &Vec<Value>,
+        msg: &[Value],
         id: &str,
-    ) -> Result<Option<Position>, Box<dyn std::error::Error + Sync + Send>> {
+    ) -> Result<Option<Vec3>, Box<dyn std::error::Error + Sync + Send>> {
         let positions = msg
             .first()
             .ok_or("Wrong Message Type")?
@@ -123,7 +130,7 @@ impl MessageParser {
         });
 
         if let Some(id_index) = id_index {
-            Ok(Some(Position {
+            Ok(Some(Vec3 {
                 x: positions
                     .get(id_index + 2)
                     .ok_or("Wrong Message Type")?
@@ -145,45 +152,49 @@ impl MessageParser {
         }
     }
 
-    pub fn player_update(
-        msg: &Vec<Value>,
-    ) -> Result<(bool, Option<(u32, Position)>), Box<dyn std::error::Error + Sync + Send>> {
+    pub fn player_state(
+        msg: &[Value],
+    ) -> Result<PlayerState, Box<dyn std::error::Error + Sync + Send>> {
         let first = msg.first().ok_or("Wrong Message Type")?;
 
         if let Some(first) = first.as_i64() {
             if first == 0 {
-                Ok((true, None))
+                Ok(PlayerState {
+                    is_dead: true,
+                    tick: None,
+                    position: None,
+                })
             } else {
                 Err("Wrong Message Type".into())
             }
         } else if let Some(first) = first.as_array() {
-            Ok((
-                false,
-                Some((
+            Ok(PlayerState {
+                is_dead: false,
+                tick: Some(
                     first
                         .get(0)
                         .ok_or("Wrong Message Type")?
                         .as_i64()
                         .ok_or("Tick has wrong type")? as u32,
-                    Position {
-                        x: first
-                            .get(2)
-                            .ok_or("Wrong Message Type")?
-                            .as_f64()
-                            .ok_or("Position x has wrong type")? as f32,
-                        y: first
-                            .get(3)
-                            .ok_or("Wrong Message Type")?
-                            .as_f64()
-                            .ok_or("Position y has wrong type")? as f32,
-                        z: first
-                            .get(4)
-                            .ok_or("Wrong Message Type")?
-                            .as_f64()
-                            .ok_or("Position z has wrong type")? as f32,
-                    },
-                )),
-            ))
+                ),
+                position: Some(Vec3 {
+                    x: first
+                        .get(2)
+                        .ok_or("Wrong Message Type")?
+                        .as_f64()
+                        .ok_or("Position x has wrong type")? as f32,
+                    y: first
+                        .get(3)
+                        .ok_or("Wrong Message Type")?
+                        .as_f64()
+                        .ok_or("Position y has wrong type")? as f32,
+                    z: first
+                        .get(4)
+                        .ok_or("Wrong Message Type")?
+                        .as_f64()
+                        .ok_or("Position z has wrong type")? as f32,
+                }),
+            })
         } else {
             Err("Wrong Message Type".into())
         }

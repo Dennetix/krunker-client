@@ -5,6 +5,7 @@ use tokio::{sync::Mutex, time};
 use crate::{
     messages::{MessageBuilder, MessageParser},
     socket::{Socket, SocketMessage},
+    utils::Vec3,
     Client, Game,
 };
 
@@ -14,23 +15,10 @@ pub struct Account {
     pub password: String,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Position {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-}
-
-impl Position {
-    fn max_diff_xz(&self, other: &Position, max_diff: f32) -> bool {
-        (self.x - other.x).abs() <= max_diff && (self.z - other.z).abs() <= max_diff
-    }
-}
-
 #[derive(Debug)]
 struct State {
     tick: u32,
-    position: Position,
+    position: Vec3,
     rotation: f32,
     walking: bool,
 }
@@ -76,7 +64,7 @@ impl<'a> PlayerBuilder<'a> {
             ready: false,
             in_game: false,
             walking: false,
-            position: Position {
+            position: Vec3 {
                 x: 0.0,
                 y: 0.0,
                 z: 0.0,
@@ -104,7 +92,7 @@ pub struct Player {
     ready: bool,
     in_game: bool,
     walking: bool,
-    position: Position,
+    position: Vec3,
     rotation: f32,
     state_buffer: VecDeque<State>,
 }
@@ -166,9 +154,9 @@ impl Player {
     pub fn rotation(&mut self, rotation: f32) {
         self.rotation = rotation;
         if self.rotation > 2.0 * PI {
-            self.rotation = self.rotation - 2.0 * PI;
+            self.rotation -= 2.0 * PI;
         } else if self.rotation < 0.0 {
-            self.rotation = 2.0 * PI + self.rotation;
+            self.rotation += 2.0 * PI;
         }
     }
 
@@ -271,7 +259,7 @@ impl Player {
             // spawn in game
             "0" => {
                 if let Some(spawn_position) =
-                    MessageParser::spawn_position(&msg, &self.id.as_ref().ok_or("Id not set")?)?
+                    MessageParser::spawn_position(&msg, self.id.as_ref().ok_or("Id not set")?)?
                 {
                     self.in_game = true;
                     self.walking = false;
@@ -283,34 +271,32 @@ impl Player {
             }
             // player update
             "l" => {
-                let (is_dead, state) = MessageParser::player_update(&msg)?;
-                if is_dead {
+                let state = MessageParser::player_state(&msg)?;
+                if state.is_dead {
                     self.in_game = false;
                     tokio::time::sleep(Duration::from_secs(3)).await;
                     self.enter().await?;
-                } else {
-                    if let Some((tick, position)) = state {
-                        self.state_buffer.retain(|s| s.tick >= tick);
+                } else if let (Some(tick), Some(position)) = (state.tick, state.position) {
+                    self.state_buffer.retain(|s| s.tick >= tick);
 
-                        if let Some(past_state) = self.state_buffer.front() {
-                            // Reconciliate the position if there is too much difference between the states
-                            if !position.max_diff_xz(&past_state.position, 0.5) {
-                                self.position = position;
-                                for state in self.state_buffer.iter_mut() {
-                                    if state.walking {
-                                        let dist =
-                                            self.tick_interval.as_micros() as f32 * MOVEMENT_SPEED;
-                                        self.position.x += dist * state.rotation.sin();
-                                        self.position.z += dist * -state.rotation.cos();
-                                    }
-
-                                    state.position = self.position;
+                    if let Some(past_state) = self.state_buffer.front() {
+                        // Reconciliate the position if there is too much difference between the states
+                        if !position.max_diff_xz(&past_state.position, 0.5) {
+                            self.position = position;
+                            for state in self.state_buffer.iter_mut() {
+                                if state.walking {
+                                    let dist =
+                                        self.tick_interval.as_micros() as f32 * MOVEMENT_SPEED;
+                                    self.position.x += dist * state.rotation.sin();
+                                    self.position.z += dist * -state.rotation.cos();
                                 }
+
+                                state.position = self.position;
                             }
                         }
-                    } else {
-                        return Err("Didn't receive position on player update".into());
                     }
+                } else {
+                    return Err("Didn't receive position on player update".into());
                 }
             }
             // game has ended

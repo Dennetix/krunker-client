@@ -1,5 +1,7 @@
 use crate::map::CELL_SIZE;
 
+pub type Error = Box<dyn std::error::Error + Sync + Send>;
+
 #[derive(Debug, Clone, Copy)]
 pub struct AABB {
     pub min_x: f32,
@@ -69,6 +71,12 @@ impl AABB {
             && (self.min_y < other.max_y && self.max_y > other.min_y)
             && (self.min_z < other.max_z && self.max_z > other.min_z)
     }
+
+    pub fn contains(&self, position: &Vec3) -> bool {
+        (self.min_x <= position.x && self.max_x >= position.x)
+            && (self.min_y <= position.y && self.max_y >= position.y)
+            && (self.min_z <= position.z && self.max_z >= position.z)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,18 +92,18 @@ impl Vec3 {
     }
 }
 
-pub fn position_to_cell(map_bounds: &AABB, pos: &Vec3) -> (usize, usize, usize) {
+pub fn position_to_cell(map_bounds: &AABB, position: &Vec3) -> (usize, usize, usize) {
     (
-        ((pos.x - map_bounds.min_x) / CELL_SIZE).floor() as usize,
-        ((pos.y - map_bounds.min_y) / CELL_SIZE).floor() as usize,
-        ((pos.z - map_bounds.min_z) / CELL_SIZE).floor() as usize,
+        ((position.x - map_bounds.min_x) / CELL_SIZE).floor() as usize,
+        ((position.y - map_bounds.min_y) / CELL_SIZE).floor() as usize,
+        ((position.z - map_bounds.min_z) / CELL_SIZE).floor() as usize,
     )
 }
 
-pub fn cell_to_position(map_bounds: &AABB, index: &(usize, usize, usize)) -> Vec3 {
+pub fn cell_to_position(map_bounds: &AABB, cell: &(usize, usize, usize)) -> Vec3 {
     Vec3 {
-        x: map_bounds.min_x + index.0 as f32 * CELL_SIZE + CELL_SIZE / 2.0,
-        y: map_bounds.min_y + index.1 as f32 * CELL_SIZE + CELL_SIZE / 2.0,
-        z: map_bounds.min_z + index.2 as f32 * CELL_SIZE + CELL_SIZE / 2.0,
+        x: map_bounds.min_x + cell.0 as f32 * CELL_SIZE + CELL_SIZE / 2.0,
+        y: map_bounds.min_y + cell.1 as f32 * CELL_SIZE + CELL_SIZE / 2.0,
+        z: map_bounds.min_z + cell.2 as f32 * CELL_SIZE + CELL_SIZE / 2.0,
     }
 }

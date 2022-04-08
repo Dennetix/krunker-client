@@ -1,11 +1,13 @@
 use std::{collections::VecDeque, f32::consts::PI, sync::Arc, time::Duration};
 
 use tokio::{sync::Mutex, time};
+use tracing::{debug, error};
 
 use crate::{
+    map::{Map, CELL_SIZE},
     messages::{MessageBuilder, MessageParser},
     socket::{Socket, SocketMessage},
-    utils::Vec3,
+    utils::{cell_to_position, Error, Vec3},
     Client, Game,
 };
 
@@ -23,14 +25,14 @@ struct State {
     walking: bool,
 }
 
-pub struct PlayerBuilder<'a> {
-    client: &'a Client,
+pub struct PlayerBuilder {
+    client: Arc<Mutex<Client>>,
     tick_interval: Duration,
     account: Option<Account>,
 }
 
-impl<'a> PlayerBuilder<'a> {
-    pub fn new(client: &'a Client) -> Self {
+impl PlayerBuilder {
+    pub fn new(client: Arc<Mutex<Client>>) -> Self {
         Self {
             client,
             tick_interval: Duration::from_millis(66),
@@ -48,19 +50,20 @@ impl<'a> PlayerBuilder<'a> {
         self
     }
 
-    pub async fn connect(
-        &self,
-        game: &Game,
-    ) -> Result<Arc<Mutex<Player>>, Box<dyn std::error::Error + Sync + Send>> {
-        let mut socket = Socket::new(self.client);
+    pub async fn connect(&self, game: &Game) -> Result<Arc<Mutex<Player>>, Error> {
+        let mut socket = Socket::new(&self.client).await;
         socket.connect(game).await?;
 
         let player = Arc::new(Mutex::new(Player {
+            client: self.client.clone(),
             socket,
+            game: game.clone(),
+            map: None,
             tick: 0,
             tick_interval: self.tick_interval,
             account: self.account.clone(),
             id: None,
+            disconnected: false,
             ready: false,
             in_game: false,
             walking: false,
@@ -80,15 +83,21 @@ impl<'a> PlayerBuilder<'a> {
 }
 
 const MOVEMENT_SPEED: f32 = 0.0000459;
+const WALK_TO_DISTANCE_THRESHOLD: f32 = 0.9 * CELL_SIZE;
 
 pub struct Player {
+    client: Arc<Mutex<Client>>,
     socket: Socket,
+
+    game: Game,
+    map: Option<Map>,
     tick: u32,
 
     tick_interval: Duration,
     account: Option<Account>,
 
     id: Option<String>,
+    disconnected: bool,
     ready: bool,
     in_game: bool,
     walking: bool,
@@ -98,57 +107,115 @@ pub struct Player {
 }
 
 impl Player {
-    pub async fn enter(&mut self) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-        if !self.in_game {
-            self.socket.send(&MessageBuilder::enter()).await?;
-            Ok(())
+    pub async fn enter(&mut self) -> Result<(), Error> {
+        if self.in_game || self.disconnected {
+            return Err("Player already in game or disconnected".into());
+        }
+
+        self.socket.send(&MessageBuilder::enter()).await?;
+        Ok(())
+    }
+
+    pub async fn walk_to(&mut self, position: &Vec3) -> Result<(), Error> {
+        if !self.in_game || self.disconnected {
+            return Err("Player not in game or disconnected".into());
+        }
+
+        if let Some(map) = &self.map {
+            if let (Some(start_cell), Some(end_cell)) = (
+                map.closest_walkable_cell(&self.position),
+                map.closest_walkable_cell(position),
+            ) {
+                if let Some(path) = map.find_path(&start_cell, &end_cell) {
+                    let mut interval = time::interval(self.tick_interval);
+
+                    let bounds = map.bounds;
+
+                    self.walk(true).await?;
+
+                    'outer: for cell in path.iter() {
+                        let cell_pos = cell_to_position(&bounds, cell);
+
+                        debug!("Moving to cell {:?}", cell);
+
+                        loop {
+                            if self.disconnected {
+                                break 'outer;
+                            }
+
+                            if self.in_game {
+                                if let Err(err) = self.tick().await {
+                                    return Err(err);
+                                }
+                            } else {
+                                return Err("Game ended or Player died".into());
+                            }
+
+                            self.look_at(&cell_pos);
+
+                            interval.tick().await;
+
+                            if self
+                                .position
+                                .max_diff_xz(&cell_pos, WALK_TO_DISTANCE_THRESHOLD)
+                            {
+                                debug!("Arrived at cell {:?}", cell);
+                                break;
+                            }
+                        }
+                    }
+
+                    debug!("Arrived at end cell");
+                    self.walk(false).await?;
+
+                    Ok(())
+                } else {
+                    Err("No path found".into())
+                }
+            } else {
+                Err("Position not walkable".into())
+            }
         } else {
-            Err("Player already in game".into())
+            Err("Map information not available".into())
         }
     }
 
-    pub async fn walk(
-        &mut self,
-        state: bool,
-    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-        if self.in_game {
-            self.walking = state;
-            self.socket
-                .send(&MessageBuilder::tick(
-                    self.tick,
-                    &self.tick_interval,
-                    None,
-                    Some(format!("{{\"0-4\": {}}}", if state { 1 } else { -1 })),
-                )?)
-                .await?;
-            self.tick += 1;
-            Ok(())
-        } else {
-            Err("Player not in game".into())
+    pub async fn walk(&mut self, state: bool) -> Result<(), Error> {
+        if !self.in_game || self.disconnected {
+            return Err("Player not in game or disconnected".into());
         }
+
+        self.walking = state;
+        self.socket
+            .send(&MessageBuilder::tick(
+                self.tick,
+                &self.tick_interval,
+                None,
+                Some(format!("{{\"0-4\": {}}}", if state { 1 } else { -1 })),
+            )?)
+            .await?;
+        self.tick += 1;
+        Ok(())
     }
 
-    pub async fn shoot(
-        &mut self,
-        state: bool,
-    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-        if self.in_game {
-            self.socket
-                .send(&MessageBuilder::tick(
-                    self.tick,
-                    &self.tick_interval,
-                    None,
-                    Some(format!(
-                        "{{\"0-5\": {s}, \"0-6\": {s}}}",
-                        s = if state { 1 } else { 0 }
-                    )),
-                )?)
-                .await?;
-            self.tick += 1;
-            Ok(())
-        } else {
-            Err("Player not in game".into())
+    pub async fn shoot(&mut self, state: bool) -> Result<(), Error> {
+        if !self.in_game || self.disconnected {
+            return Err("Player not in game or disconnected".into());
         }
+
+        self.socket
+            .send(&MessageBuilder::tick(
+                self.tick,
+                &self.tick_interval,
+                None,
+                Some(format!(
+                    "{{\"0-5\": {s}, \"0-6\": {s}}}",
+                    s = if state { 1 } else { 0 }
+                )),
+            )?)
+            .await?;
+        self.tick += 1;
+        Ok(())
     }
 
     pub fn rotation(&mut self, rotation: f32) {
@@ -164,8 +231,30 @@ impl Player {
         self.rotation(self.rotation + rotation);
     }
 
+    pub fn look_at(&mut self, position: &Vec3) {
+        self.rotation(
+            (position.z - self.position.z).atan2(position.x - self.position.x) + PI / 2.0,
+        );
+    }
+
+    pub async fn disconnect(&mut self) -> Result<(), Error> {
+        self.ready = false;
+        self.in_game = false;
+
+        if !self.disconnected {
+            self.disconnected = true;
+            self.socket.close().await?;
+        }
+
+        Ok(())
+    }
+
     pub fn in_game(&self) -> bool {
         self.in_game
+    }
+
+    pub fn map(&self) -> Option<&Map> {
+        self.map.as_ref()
     }
 
     fn run_tick(this: Arc<Mutex<Self>>) {
@@ -176,59 +265,63 @@ impl Player {
 
                 let mut this_lock = this.lock().await;
 
-                if this_lock.in_game {
-                    if let Err(err) = this_lock.tick().await {
-                        println!("Failed to execute player tick: {}", err);
-                    }
+                if this_lock.disconnected {
+                    break;
                 }
 
-                for msg in this_lock.socket.get_messages().await {
-                    match msg {
-                        SocketMessage::Message(msg_type, msg) => {
-                            if let Err(err) = this_lock.process_message(msg_type, msg).await {
-                                println!("Failed to process server message: {}", err);
-                            }
-                        }
-                        _ => (),
-                    }
+                if let Err(err) = this_lock.tick().await {
+                    error!("Failed to execute player tick: {}", err);
                 }
             }
         });
     }
 
-    async fn tick(&mut self) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-        self.socket
-            .send(&MessageBuilder::tick(
-                self.tick,
-                &self.tick_interval,
-                Some(self.rotation),
-                None,
-            )?)
-            .await?;
-        self.tick += 1;
+    async fn tick(&mut self) -> Result<(), Error> {
+        if self.in_game {
+            self.socket
+                .send(&MessageBuilder::tick(
+                    self.tick,
+                    &self.tick_interval,
+                    Some(self.rotation),
+                    None,
+                )?)
+                .await?;
+            self.tick += 1;
 
-        if self.walking {
-            let dist = self.tick_interval.as_micros() as f32 * MOVEMENT_SPEED;
-            self.position.x += dist * self.rotation.sin();
-            self.position.z += dist * -self.rotation.cos();
+            if self.walking {
+                let dist = self.tick_interval.as_micros() as f32 * MOVEMENT_SPEED;
+                self.position.x += dist * self.rotation.sin();
+                self.position.z += dist * -self.rotation.cos();
+            }
+
+            self.state_buffer.push_back(State {
+                tick: self.tick,
+                position: self.position,
+                rotation: self.rotation,
+                walking: self.walking,
+            });
         }
 
-        self.state_buffer.push_back(State {
-            tick: self.tick,
-            position: self.position,
-            rotation: self.rotation,
-            walking: self.walking,
-        });
+        for msg in self.socket.get_messages().await {
+            match msg {
+                SocketMessage::Message(msg_type, msg) => {
+                    if let Err(err) = self.process_message(&msg_type, msg).await {
+                        error!("Failed to process server message '{}': {}", msg_type, err);
+                    }
+                }
+                _ => (),
+            }
+        }
 
         Ok(())
     }
 
     async fn process_message(
         &mut self,
-        msg_type: String,
+        msg_type: &str,
         msg: Vec<serde_json::Value>,
-    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-        match msg_type.as_str() {
+    ) -> Result<(), Error> {
+        match msg_type {
             // ping
             "pi" => {
                 self.socket.send(&MessageBuilder::pong()).await?;
@@ -243,6 +336,15 @@ impl Player {
             }
             // sent after connect and at the start of every game
             "init" => {
+                self.game.update_info().await?;
+                self.map = self
+                    .client
+                    .lock()
+                    .await
+                    .maps
+                    .iter()
+                    .find(|map| map.name == self.game.map)
+                    .cloned();
                 if self.ready {
                     self.enter().await?;
                 }

@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::{player::Account, utils::Vec3};
+use crate::{
+    player::Account,
+    utils::{Error, Vec3},
+};
 
 pub struct MessageBuilder;
 
@@ -66,7 +69,7 @@ impl MessageBuilder {
         tick_interval: &Duration,
         rotation: Option<f32>,
         state_str: Option<String>,
-    ) -> Result<Value, Box<dyn std::error::Error + Sync + Send>> {
+    ) -> Result<Value, Error> {
         let rotation = if let Some(rotation) = rotation {
             json!([0, (rotation * -1000.0).round() as i32])
         } else {
@@ -102,7 +105,7 @@ pub struct PlayerState {
 pub struct MessageParser;
 
 impl MessageParser {
-    pub fn io_init(msg: &[Value]) -> Result<String, Box<dyn std::error::Error + Sync + Send>> {
+    pub fn io_init(msg: &[Value]) -> Result<String, Error> {
         Ok(msg
             .first()
             .ok_or("Wrong Message Type")?
@@ -111,10 +114,7 @@ impl MessageParser {
             .to_owned())
     }
 
-    pub fn spawn_position(
-        msg: &[Value],
-        id: &str,
-    ) -> Result<Option<Vec3>, Box<dyn std::error::Error + Sync + Send>> {
+    pub fn spawn_position(msg: &[Value], id: &str) -> Result<Option<Vec3>, Error> {
         let positions = msg
             .first()
             .ok_or("Wrong Message Type")?
@@ -152,9 +152,7 @@ impl MessageParser {
         }
     }
 
-    pub fn player_state(
-        msg: &[Value],
-    ) -> Result<PlayerState, Box<dyn std::error::Error + Sync + Send>> {
+    pub fn player_state(msg: &[Value]) -> Result<PlayerState, Error> {
         let first = msg.first().ok_or("Wrong Message Type")?;
 
         if let Some(first) = first.as_i64() {

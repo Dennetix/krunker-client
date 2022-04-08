@@ -3,10 +3,11 @@ use std::collections::VecDeque;
 use ndarray::{Array2, Array3};
 use pathfinding::prelude::astar;
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
-use crate::utils::{position_to_cell, Vec3, AABB};
+use crate::utils::{position_to_cell, Error, Vec3, AABB};
 
-const COLLIDABLE_OBJECT_IDS: [u32; 8] = [1, 2, 8, 9, 17, 19, 49, 50];
+const EXCLUDE_OBJECT_IDS: [u32; 12] = [4, 13, 14, 15, 18, 23, 26, 29, 32, 38, 45, 77];
 const MAX_MAP_BOUNDS: AABB = AABB {
     min_x: -800.0,
     min_y: -200.0,
@@ -21,26 +22,34 @@ const CHUNK_SIZE: f32 = 130.0 * CELL_SIZE;
 const PLAYER_HEIGHT: usize = (15.0 / CELL_SIZE) as usize;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-struct RawMapObject {
+pub struct RawMapObject {
     #[serde(rename = "p")]
-    position: [f32; 3],
-    #[serde(rename = "i")]
-    id: Option<u32>,
-    #[serde(rename = "l")]
-    not_collidable: Option<u8>,
-    #[serde(rename = "bo")]
-    border: Option<u32>,
+    pub position: [f32; 3],
     #[serde(rename = "si")]
-    size_index: Option<usize>,
+    pub size_index: Option<usize>,
+    #[serde(rename = "i")]
+    pub id: Option<u32>,
+    #[serde(rename = "l")]
+    pub not_collidable: Option<u8>,
+    #[serde(rename = "bo")]
+    pub border: Option<u8>,
+    #[serde(rename = "d")]
+    pub direction: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct RawMap {
-    name: String,
+pub struct RawMapConfig {
+    pub modes: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawMap {
+    pub name: String,
     #[serde(rename = "xyz")]
-    sizes: Vec<f32>,
-    objects: Vec<RawMapObject>,
-    spawns: Vec<Vec<Option<f32>>>,
+    pub sizes: Vec<f32>,
+    pub objects: Vec<RawMapObject>,
+    pub config: RawMapConfig,
+    pub spawns: Vec<Vec<Option<f32>>>,
 }
 
 impl RawMap {
@@ -71,29 +80,34 @@ impl RawMap {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Ramp {
+    bounds: AABB,
+    direction: u8,
+}
+
+type FilteredObjects = (AABB, Vec<AABB>, Vec<Ramp>);
+
 #[derive(Debug, Clone)]
 struct Chunk<'a> {
     bounds: AABB,
     objects: Vec<&'a AABB>,
-    ramps: Vec<&'a AABB>,
+    ramps: Vec<&'a Ramp>,
 }
-
-type FilteredObjects = (AABB, Vec<AABB>, Vec<AABB>);
 
 #[derive(Debug, Clone)]
 pub struct Map {
-    pub(crate) id: u32,
     pub(crate) name: String,
-    spawns: Vec<Vec3>,
-    walkable_grid: Array3<u8>,
+    pub(crate) spawns: Vec<Vec3>,
+    pub(crate) bounds: AABB,
+    pub(crate) walkable_grid: Array3<u8>,
 }
 
 impl Map {
-    pub fn new(id: u32, map_json: &str) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        let raw_map = serde_json::from_str::<RawMap>(map_json)?;
-        println!("Loading {}", raw_map.name);
+    pub fn new(raw_map: &RawMap) -> Result<Self, Error> {
+        debug!("Loading {}", raw_map.name);
 
-        let (map_bounds, objects, ramps) = Self::filter_objects(&raw_map)?;
+        let (map_bounds, objects, ramps) = Self::filter_objects(raw_map)?;
 
         let spawns = raw_map
             .spawns
@@ -103,13 +117,13 @@ impl Map {
                     Err("Raw map spawn contains less than 3 coordinates".into())
                 } else {
                     Ok(Vec3 {
-                        x: s[0].unwrap(),
-                        y: s[1].unwrap(),
-                        z: s[2].unwrap(),
+                        x: s[0].ok_or("Spawn coordinate is null")?,
+                        y: s[1].ok_or("Spawn coordinate is null")?,
+                        z: s[2].ok_or("Spawn coordinate is null")?,
                     })
                 }
             })
-            .collect::<Result<Vec<Vec3>, Box<dyn std::error::Error + Sync + Send>>>()?;
+            .collect::<Result<Vec<_>, Error>>()?;
 
         let walkable_grid = Self::generate_walkable_grid(
             &Self::generate_grid(
@@ -120,34 +134,34 @@ impl Map {
             &spawns,
         )?;
 
-        println!("Finished loading {}", raw_map.name);
+        debug!("Finished loading {}", raw_map.name);
 
         Ok(Self {
-            id,
-            name: raw_map.name,
+            name: raw_map.name.clone(),
             spawns,
+            bounds: map_bounds,
             walkable_grid,
         })
     }
 
-    fn filter_objects(
-        raw: &RawMap,
-    ) -> Result<FilteredObjects, Box<dyn std::error::Error + Sync + Send>> {
+    fn filter_objects(raw: &RawMap) -> Result<FilteredObjects, Error> {
         let mut map_bounds = AABB::zero();
 
         // estimate the number of objects to avoid frequent allocation
         let mut objects = Vec::<AABB>::with_capacity(raw.objects.len() / 3);
-        let mut ramps = Vec::<AABB>::new();
+        let mut ramps = Vec::<Ramp>::new();
 
         let sizes = raw.get_size_groups();
         for object in raw.objects.iter() {
             // filter out everything that is not collidable
+            if object.not_collidable.is_some() {
+                continue;
+            }
+
             if let Some(id) = object.id {
-                if !COLLIDABLE_OBJECT_IDS.contains(&id) {
+                if EXCLUDE_OBJECT_IDS.contains(&id) {
                     continue;
                 }
-            } else if object.not_collidable.is_some() {
-                continue;
             }
 
             if let Some(size_index) = object.size_index {
@@ -173,7 +187,10 @@ impl Map {
 
                 if let Some(id) = object.id {
                     if id == 9 {
-                        ramps.push(bounds);
+                        ramps.push(Ramp {
+                            bounds,
+                            direction: object.direction.unwrap_or(0),
+                        });
                         continue;
                     }
                 }
@@ -190,7 +207,7 @@ impl Map {
     fn generate_object_chunks<'a>(
         map_bounds: &AABB,
         objects: &'a [AABB],
-        ramps: &'a [AABB],
+        ramps: &'a [Ramp],
     ) -> Array2<Chunk<'a>> {
         let chunk_shape = (
             ((map_bounds.max_x - map_bounds.min_x) / CHUNK_SIZE).ceil() as usize,
@@ -209,7 +226,7 @@ impl Map {
 
             let mut chunk_objects =
                 Vec::<&'a AABB>::with_capacity(objects.len() / (chunk_shape.0 * chunk_shape.1));
-            let mut chunk_ramps = Vec::<&'a AABB>::new();
+            let mut chunk_ramps = Vec::<&'a Ramp>::new();
 
             for object in objects.iter() {
                 if chunk_bounds.intersects(object) {
@@ -218,7 +235,7 @@ impl Map {
             }
 
             for ramp in ramps.iter() {
-                if chunk_bounds.intersects(ramp) {
+                if chunk_bounds.intersects(&ramp.bounds) {
                     chunk_ramps.push(ramp);
                 }
             }
@@ -253,8 +270,8 @@ impl Map {
                     let mut cell = 0_u8;
 
                     for ramp in chunk.ramps.iter() {
-                        if cell_bounds.intersects(ramp) {
-                            cell = 2;
+                        if cell_bounds.intersects(&ramp.bounds) {
+                            cell = 2 + ramp.direction;
                             break;
                         }
                     }
@@ -278,7 +295,7 @@ impl Map {
         grid: &Array3<u8>,
         map_bounds: &AABB,
         spawns: &[Vec3],
-    ) -> Result<Array3<u8>, Box<dyn std::error::Error + Sync + Send>> {
+    ) -> Result<Array3<u8>, Error> {
         let shape = grid.shape();
         let grid_size = (shape[0], shape[1], shape[2]);
 
@@ -295,7 +312,7 @@ impl Map {
                     }
                     cell
                 })
-                .collect::<Vec<(usize, usize, usize)>>(),
+                .collect::<Vec<_>>(),
         );
 
         while let Some(cell) = cells_to_see.pop_front() {
@@ -428,8 +445,8 @@ impl Map {
             .collect()
     }
 
-    fn is_cell_walkable(cell: &(usize, usize, usize), walkable_grid: &Array3<u8>) -> bool {
-        let shape = walkable_grid.shape();
+    fn is_cell_walkable(cell: &(usize, usize, usize), grid: &Array3<u8>) -> bool {
+        let shape = grid.shape();
         let grid_size = (shape[0], shape[1], shape[2]);
 
         // check if the following checks are in bounds
@@ -440,43 +457,51 @@ impl Map {
             return false;
         }
 
-        if walkable_grid[*cell] == 0 {
-            // check if cell below is filled
-            if walkable_grid[(cell.0, cell.1 - 1, cell.2)] != 1 {
+        // check that cell and cells above are air or ramp
+        for i in 0..(PLAYER_HEIGHT - 1) {
+            if grid[(cell.0, cell.1 + i, cell.2)] == 1 {
                 return false;
             }
+        }
 
-            // check if cells above are air
-            for i in 1..(PLAYER_HEIGHT - 1) {
-                if walkable_grid[(cell.0, cell.1 + i, cell.2)] != 0 {
-                    return false;
-                }
-            }
-        } else if walkable_grid[*cell] == 2 {
-            // check if cells above are air or ramp
-            for i in 1..(PLAYER_HEIGHT - 1) {
-                if walkable_grid[(cell.0, cell.1 + i, cell.2)] == 1 {
-                    return false;
-                }
-            }
-        } else {
+        // check that cell below is filled or ramp
+        if grid[(cell.0, cell.1 - 1, cell.2)] == 0 {
             return false;
         }
 
-        // check if the 8 surrounding cells are air or ramp
-        for neighbour in
-            Self::horizontal_neighbours(&(cell.0, cell.1 + 1, cell.2), &grid_size, true).into_iter()
-        {
-            if walkable_grid[neighbour] == 1 {
-                return false;
+        if grid[*cell] == 0 {
+            // make sure that all filled blocks connected to the wrong site of a ramp are not walkable
+            for i in 0..2 {
+                if grid[(cell.0 - 1, cell.1 - i, cell.2)] == 3
+                    || grid[(cell.0 - 1, cell.1 - i, cell.2)] == 5
+                    || grid[(cell.0 + 1, cell.1 - i, cell.2)] == 3
+                    || grid[(cell.0 + 1, cell.1 - i, cell.2)] == 5
+                    || grid[(cell.0, cell.1 - i, cell.2 - 1)] == 2
+                    || grid[(cell.0, cell.1 - i, cell.2 - 1)] == 4
+                    || grid[(cell.0, cell.1 - i, cell.2 + 1)] == 2
+                    || grid[(cell.0, cell.1 - i, cell.2 + 1)] == 4
+                {
+                    return false;
+                }
+            }
+
+            for neighbour in Self::horizontal_neighbours(cell, &grid_size, true) {
+                // check that surrounding cells are filled or ramp on the same height or one above or below
+                if grid[(neighbour.0, neighbour.1 - 2, neighbour.2)] == 0
+                    && grid[(neighbour.0, neighbour.1 - 1, neighbour.2)] == 0
+                    && grid[neighbour] == 0
+                {
+                    return false;
+                }
+
+                // check that surrounding cells above are air or ramp
+                if grid[(neighbour.0, neighbour.1 + 1, neighbour.2)] == 1 {
+                    return false;
+                }
             }
         }
 
         true
-    }
-
-    pub fn id(&self) -> u32 {
-        self.id
     }
 
     pub fn name(&self) -> String {
@@ -485,6 +510,32 @@ impl Map {
 
     pub fn spawns(&self) -> Vec<Vec3> {
         self.spawns.clone()
+    }
+
+    pub fn closest_walkable_cell(&self, position: &Vec3) -> Option<(usize, usize, usize)> {
+        if !self.bounds.contains(position) {
+            return None;
+        }
+
+        let shape = self.walkable_grid.shape();
+        let grid_size = (shape[0], shape[1], shape[2]);
+
+        let exact_cell = position_to_cell(&self.bounds, position);
+        let mut cells = Vec::<(usize, usize, usize)>::new();
+
+        for y in 0..grid_size.1 {
+            if self.walkable_grid[(exact_cell.0, y, exact_cell.2)] != 0 {
+                cells.push((exact_cell.0, y, exact_cell.2));
+            }
+        }
+
+        cells.sort_by(|a, b| {
+            (a.1 as isize - exact_cell.1 as isize)
+                .abs()
+                .cmp(&(b.1 as isize - exact_cell.1 as isize).abs())
+        });
+
+        cells.get(0).cloned()
     }
 
     pub fn find_path(
@@ -502,12 +553,21 @@ impl Map {
                     .iter()
                     .filter_map(|c| {
                         if self.walkable_grid[*c] > 0 {
-                            Some((*c, if cell.1 != c.1 { 2 } else { 1 }))
+                            for n in Self::horizontal_neighbours(c, &grid_size, true) {
+                                if self.walkable_grid[n] == 0
+                                    && self.walkable_grid[(n.0, n.1 + 1, n.2)] == 0
+                                    && self.walkable_grid[(n.0, n.1 - 1, n.2)] == 0
+                                {
+                                    return Some((*c, 3));
+                                }
+                            }
+
+                            Some((*c, if cell.1 == c.1 { 1 } else { 2 }))
                         } else {
                             None
                         }
                     })
-                    .collect::<Vec<((usize, usize, usize), u32)>>()
+                    .collect::<Vec<_>>()
             },
             |cell| {
                 ((cell.0 as f32 - end_cell.0 as f32).powi(2)

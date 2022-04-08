@@ -4,30 +4,43 @@ pub mod player;
 pub mod socket;
 pub mod utils;
 
-use std::str::from_utf8;
+use std::{str::from_utf8, sync::Arc};
 
-use map::Map;
+use futures_util::future::try_join_all;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinHandle;
+use tokio::sync::Mutex;
+use tracing::info;
+
+use crate::{
+    map::{Map, RawMap},
+    utils::Error,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct GETGameList {
-    games: Vec<(
-        String, // Game id
-        String, // Region
-        u8,     // players
-        u8,     // max players
-        GETGameListGameInfo,
-    )>,
+struct RawGameInfo {
+    #[serde(rename = "c")]
+    custom: u8,
+    #[serde(rename = "v")]
+    version: String,
+    #[serde(rename = "i")]
+    map: String,
+    #[serde(rename = "g")]
+    mode: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct GETGameListGameInfo {
-    c: u8,     // 1 if custom game
-    v: String, // Version
-    i: String, // Map name
-    g: u8,     // Mode
+struct RawGame(
+    String, // Game id
+    String, // Region
+    u8,     // players
+    u8,     // max players
+    RawGameInfo,
+);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawGameList {
+    games: Vec<RawGame>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,12 +51,14 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+    pub async fn new() -> Result<Arc<Mutex<Self>>, Error> {
+        info!("Downloading krunker source...");
+
         let req_client = reqwest::Client::new();
 
         let (source, client_key) = tokio::join!(
             async {
-                //TODO: get key on the client
+                // Get the source to extract the prime number for rotating the padding bytes
                 req_client
                     .get("https://api.sys32.dev/v3/source")
                     .send()
@@ -53,8 +68,7 @@ impl Client {
                     .await
             },
             async {
-                // Get the source to extract the prime number for rotating the padding bytes
-                // TODO: See if there is a way to get it without the source
+                // TODO: get key on the client
                 req_client
                     .get("https://api.sys32.dev/v3/key")
                     .send()
@@ -75,34 +89,51 @@ impl Client {
             .as_str()
             .parse::<u16>()?;
 
-        let mut map_counter = -1;
-        let tasks = Regex::new(r#"\{"name":"[^"]+",[^']+"#)?
-            .find_iter(&source)
-            .skip(1)
-            .map(|m| {
-                map_counter += 1;
-                let map_json = m.as_str().to_owned();
-                tokio::spawn(async move { Map::new(map_counter as u32, &map_json) })
-            })
-            .collect::<Vec<JoinHandle<Result<Map, Box<dyn std::error::Error + Sync + Send>>>>>();
-
-        println!("Loading {} maps", map_counter + 1);
-
-        let mut maps = Vec::<Map>::with_capacity(map_counter as usize + 1);
-        for task in tasks {
-            maps.push(task.await??);
-        }
-
-        Ok(Self {
+        Ok(Arc::new(Mutex::new(Self {
             prime,
             client_key: client_key?,
-            maps,
-        })
+            maps: Self::load_maps(&source).await?,
+        })))
     }
 
-    pub async fn games(&self) -> Result<Vec<Game>, Box<dyn std::error::Error + Sync + Send>> {
+    async fn load_maps(source: &str) -> Result<Vec<Map>, Error> {
+        let maps = Regex::new(r#"\{"name":"[^"]+",[^']+"#)?
+            .find_iter(source)
+            .skip(1)
+            .filter_map(|map| {
+                let raw_map = serde_json::from_str::<RawMap>(map.as_str());
+                match raw_map {
+                    Ok(raw_map) => {
+                        if raw_map.config.modes.contains(&0) {
+                            Some(Ok(raw_map))
+                        } else {
+                            None
+                        }
+                    }
+                    Err(err) => Some(Err(err)),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        info!("Parsing {} maps...", maps.len());
+
+        let tasks = maps
+            .into_iter()
+            .map(|map| {
+                let raw_map = map?;
+                Ok(tokio::spawn(async move { Map::new(&raw_map) }))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        try_join_all(tasks)
+            .await?
+            .into_iter()
+            .collect::<Result<Vec<_>, Error>>()
+    }
+
+    pub async fn games(&self) -> Result<Vec<Game>, Error> {
         let req_client = reqwest::Client::new();
-        let games: GETGameList = req_client
+        let raw_games: RawGameList = req_client
             .get("https://matchmaker.krunker.io/game-list")
             .query(&[("hostname", "krunker.io")])
             .send()
@@ -110,35 +141,30 @@ impl Client {
             .json()
             .await?;
 
-        let games: Vec<Game> = games
+        let games: Vec<Game> = raw_games
             .games
-            .iter()
+            .into_iter()
             .map(|game| Game {
                 client_key: self.client_key.clone(),
-                id: game.0.clone(),
-                region: game.1.clone(),
+                id: game.0,
+                region: game.1,
                 players: game.2,
                 max_players: game.3,
-                custom: game.4.c != 0,
-                version: game.4.v.clone(),
-                map: game.4.i.clone(),
-                mode: game.4.g.to_string(), // TODO: actually convert into mode name
+                custom: game.4.custom != 0,
+                version: game.4.version,
+                map: game.4.map,
+                mode: game.4.mode,
             })
             .collect();
 
         Ok(games)
     }
 
-    pub fn map(&self, id: Option<u32>, name: Option<&str>) -> Option<&Map> {
-        self.maps.iter().find(|map| {
-            if let Some(id) = id {
-                map.id == id
-            } else if let Some(name) = name {
-                map.name == name
-            } else {
-                false
-            }
-        })
+    pub fn available_maps(&self) -> Vec<String> {
+        self.maps
+            .iter()
+            .map(|map| map.name.clone())
+            .collect::<Vec<_>>()
     }
 }
 
@@ -152,11 +178,11 @@ pub struct Game {
     pub max_players: u8,
     pub custom: bool,
     pub map: String,
-    pub mode: String,
+    pub mode: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GameInfo {
+pub struct GameConnectInfo {
     pub host: String,
     #[serde(rename = "clientId")]
     pub client_id: String,
@@ -165,7 +191,7 @@ pub struct GameInfo {
 }
 
 impl Game {
-    pub async fn generate_token(&self) -> Result<String, Box<dyn std::error::Error + Sync + Send>> {
+    pub async fn validation_token(&self) -> Result<String, Error> {
         let req_client = reqwest::Client::new();
 
         let token: serde_json::Value = req_client
@@ -188,16 +214,16 @@ impl Game {
         Ok(from_utf8(&token_hash)?.to_string())
     }
 
-    pub async fn game_info(&self) -> Result<GameInfo, Box<dyn std::error::Error + Sync + Send>> {
+    pub async fn connect_info(&self) -> Result<GameConnectInfo, Error> {
         let req_client = reqwest::Client::new();
-        let game_info: GameInfo = req_client
+        let game_info: GameConnectInfo = req_client
             .get("https://matchmaker.krunker.io/seek-game")
             .header("Origin", "https://krunker.io")
             .query(&[
                 ("hostname", "krunker.io"),
                 ("region", &self.region),
                 ("autoChangeGame", "false"),
-                ("validationToken", &self.generate_token().await?),
+                ("validationToken", &self.validation_token().await?),
                 ("game", &self.id),
                 ("dataQuery", &format!("{{\"v\":\"{}\"}}", self.version)),
             ])
@@ -207,5 +233,22 @@ impl Game {
             .await?;
 
         Ok(game_info)
+    }
+
+    pub async fn update_info(&mut self) -> Result<(), Error> {
+        let req_client = reqwest::Client::new();
+        let raw_game: RawGame = req_client
+            .get("https://matchmaker.krunker.io/game-info")
+            .query(&[("game", &self.id)])
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        self.players = raw_game.2;
+        self.mode = raw_game.4.mode;
+        self.map = raw_game.4.map;
+
+        Ok(())
     }
 }

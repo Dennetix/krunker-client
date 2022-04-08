@@ -12,14 +12,14 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 
-use crate::{Client, Game};
+use crate::{utils::Error, Client, Game};
 
 type WSSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
 #[derive(Debug)]
 pub enum SocketMessage {
     Message(String, Vec<serde_json::Value>),
-    Error(Box<dyn std::error::Error + Sync + Send>),
+    Error(Error),
     Close,
 }
 
@@ -31,20 +31,17 @@ pub struct Socket {
 }
 
 impl Socket {
-    pub fn new(client: &Client) -> Self {
+    pub async fn new(client: &Arc<Mutex<Client>>) -> Self {
         Self {
             ws_write: None,
             messages: Arc::new(Mutex::new(vec![])),
-            prime: client.prime,
+            prime: client.lock().await.prime,
             num: 0,
         }
     }
 
-    pub async fn connect(
-        &mut self,
-        game: &Game,
-    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-        let game_info = game.game_info().await?;
+    pub async fn connect(&mut self, game: &Game) -> Result<(), Error> {
+        let game_info = game.connect_info().await?;
 
         let req = Request::builder()
             .header("Host", game_info.host.clone())
@@ -93,10 +90,7 @@ impl Socket {
         Ok(())
     }
 
-    pub async fn send<S: Serialize>(
-        &mut self,
-        msg: &S,
-    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+    pub async fn send<S: Serialize>(&mut self, msg: &S) -> Result<(), Error> {
         let msg = self.encode_message(msg)?;
         self.ws_write
             .as_mut()
@@ -107,7 +101,7 @@ impl Socket {
         Ok(())
     }
 
-    pub async fn close(&mut self) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+    pub async fn close(&mut self) -> Result<(), Error> {
         if let Some(ws_write) = self.ws_write.as_mut() {
             ws_write.close().await?;
             self.ws_write = None;
@@ -123,10 +117,7 @@ impl Socket {
         self.messages.lock().await.drain(..).collect()
     }
 
-    pub fn encode_message<S: Serialize>(
-        &mut self,
-        msg: &S,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Sync + Send>> {
+    pub fn encode_message<S: Serialize>(&mut self, msg: &S) -> Result<Vec<u8>, Error> {
         // Encode the actual data with msgpack
         let mut encoded = rmp_serde::encode::to_vec(msg)?;
 
@@ -139,16 +130,21 @@ impl Socket {
         Ok(encoded)
     }
 
-    pub fn decode_message(
-        msg: &[u8],
-    ) -> Result<(String, Vec<serde_json::Value>), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn decode_message(msg: &[u8]) -> Result<(String, Vec<serde_json::Value>), Error> {
         // Decode the message without the last two padding bytes wich are unused in the game
         let mut decoded =
             rmp_serde::decode::from_slice::<serde_json::Value>(&msg[..msg.len() - 2])?;
-        let decoded = decoded.as_array_mut().unwrap();
+        let decoded = decoded
+            .as_array_mut()
+            .ok_or("Decoded message is not an array")?;
 
         Ok((
-            decoded.first().unwrap().as_str().unwrap().to_owned(),
+            decoded
+                .first()
+                .ok_or("Decoded message length is zero")?
+                .as_str()
+                .ok_or("Decoded message type is not a string")?
+                .to_owned(),
             decoded[1..].to_vec(),
         ))
     }

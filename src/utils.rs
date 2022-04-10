@@ -90,6 +90,10 @@ impl Vec3 {
     pub fn max_diff_xz(&self, other: &Self, max_diff: f32) -> bool {
         (self.x - other.x).abs() <= max_diff && (self.z - other.z).abs() <= max_diff
     }
+
+    pub fn max_diff_y(&self, other: &Self, max_diff: f32) -> bool {
+        (self.y - other.y).abs() <= max_diff
+    }
 }
 
 pub fn position_to_cell(map_bounds: &AABB, position: &Vec3) -> (usize, usize, usize) {

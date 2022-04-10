@@ -4,7 +4,7 @@ use tokio::{sync::Mutex, time};
 use tracing::{debug, error};
 
 use crate::{
-    map::{Map, CELL_SIZE},
+    map::Map,
     messages::{MessageBuilder, MessageParser},
     socket::{Socket, SocketMessage},
     utils::{cell_to_position, Error, Vec3},
@@ -83,7 +83,8 @@ impl PlayerBuilder {
 }
 
 const MOVEMENT_SPEED: f32 = 0.0000459;
-const WALK_TO_DISTANCE_THRESHOLD: f32 = 0.9 * CELL_SIZE;
+const WALK_TO_DISTANCE_XZ_THRESHOLD: f32 = 2.6;
+const WALK_TO_DISTANCE_Y_THRESHOLD: f32 = 8.25;
 
 pub struct Player {
     client: Arc<Mutex<Client>>,
@@ -133,7 +134,8 @@ impl Player {
 
                     self.walk(true).await?;
 
-                    'outer: for cell in path.iter() {
+                    let mut last_cell = path[0];
+                    'outer: for cell in path.iter().skip(1) {
                         let cell_pos = cell_to_position(&bounds, cell);
 
                         debug!("Moving to cell {:?}", cell);
@@ -157,12 +159,18 @@ impl Player {
 
                             if self
                                 .position
-                                .max_diff_xz(&cell_pos, WALK_TO_DISTANCE_THRESHOLD)
+                                .max_diff_xz(&cell_pos, WALK_TO_DISTANCE_XZ_THRESHOLD)
+                                && (last_cell.1 >= cell.1
+                                    || self
+                                        .position
+                                        .max_diff_y(&cell_pos, WALK_TO_DISTANCE_Y_THRESHOLD))
                             {
                                 debug!("Arrived at cell {:?}", cell);
                                 break;
                             }
                         }
+
+                        last_cell = *cell;
                     }
 
                     debug!("Arrived at end cell");

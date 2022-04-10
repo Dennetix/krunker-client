@@ -17,7 +17,7 @@ const MAX_MAP_BOUNDS: AABB = AABB {
     max_z: 800.0,
 };
 
-pub(crate) const CELL_SIZE: f32 = 2.5;
+pub(crate) const CELL_SIZE: f32 = 2.4;
 const CHUNK_SIZE: f32 = 130.0 * CELL_SIZE;
 const PLAYER_HEIGHT: usize = (15.0 / CELL_SIZE) as usize;
 
@@ -86,13 +86,14 @@ struct Ramp {
     direction: u8,
 }
 
-type FilteredObjects = (AABB, Vec<AABB>, Vec<Ramp>);
+type FilteredObjects = (AABB, Vec<AABB>, Vec<Ramp>, Vec<AABB>);
 
 #[derive(Debug, Clone)]
 struct Chunk<'a> {
     bounds: AABB,
     objects: Vec<&'a AABB>,
     ramps: Vec<&'a Ramp>,
+    ladders: Vec<&'a AABB>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,7 +108,7 @@ impl Map {
     pub fn new(raw_map: &RawMap) -> Result<Self, Error> {
         debug!("Loading {}", raw_map.name);
 
-        let (map_bounds, objects, ramps) = Self::filter_objects(raw_map)?;
+        let (map_bounds, objects, ramps, ladders) = Self::filter_objects(raw_map)?;
 
         let spawns = raw_map
             .spawns
@@ -128,7 +129,7 @@ impl Map {
         let walkable_grid = Self::generate_walkable_grid(
             &Self::generate_grid(
                 &map_bounds,
-                &Self::generate_object_chunks(&map_bounds, &objects, &ramps),
+                &Self::generate_object_chunks(&map_bounds, &objects, &ramps, &ladders),
             ),
             &map_bounds,
             &spawns,
@@ -150,6 +151,7 @@ impl Map {
         // estimate the number of objects to avoid frequent allocation
         let mut objects = Vec::<AABB>::with_capacity(raw.objects.len() / 3);
         let mut ramps = Vec::<Ramp>::new();
+        let mut ladders = Vec::<AABB>::new();
 
         let sizes = raw.get_size_groups();
         for object in raw.objects.iter() {
@@ -187,10 +189,15 @@ impl Map {
 
                 if let Some(id) = object.id {
                     if id == 9 {
+                        // is ramp
                         ramps.push(Ramp {
                             bounds,
                             direction: object.direction.unwrap_or(0),
                         });
+                        continue;
+                    } else if id == 3 {
+                        // is ladder
+                        ladders.push(bounds);
                         continue;
                     }
                 }
@@ -201,13 +208,14 @@ impl Map {
 
         map_bounds.limit_by(&MAX_MAP_BOUNDS);
 
-        Ok((map_bounds, objects, ramps))
+        Ok((map_bounds, objects, ramps, ladders))
     }
 
     fn generate_object_chunks<'a>(
         map_bounds: &AABB,
         objects: &'a [AABB],
         ramps: &'a [Ramp],
+        ladders: &'a [AABB],
     ) -> Array2<Chunk<'a>> {
         let chunk_shape = (
             ((map_bounds.max_x - map_bounds.min_x) / CHUNK_SIZE).ceil() as usize,
@@ -227,6 +235,7 @@ impl Map {
             let mut chunk_objects =
                 Vec::<&'a AABB>::with_capacity(objects.len() / (chunk_shape.0 * chunk_shape.1));
             let mut chunk_ramps = Vec::<&'a Ramp>::new();
+            let mut chunk_ladders = Vec::<&'a AABB>::new();
 
             for object in objects.iter() {
                 if chunk_bounds.intersects(object) {
@@ -240,10 +249,17 @@ impl Map {
                 }
             }
 
+            for ladder in ladders.iter() {
+                if chunk_bounds.intersects(ladder) {
+                    chunk_ladders.push(ladder);
+                }
+            }
+
             Chunk {
                 bounds: chunk_bounds,
                 objects: chunk_objects,
                 ramps: chunk_ramps,
+                ladders: chunk_ladders,
             }
         })
     }
@@ -269,17 +285,28 @@ impl Map {
                 if chunk.bounds.intersects(&cell_bounds) {
                     let mut cell = 0_u8;
 
-                    for ramp in chunk.ramps.iter() {
-                        if cell_bounds.intersects(&ramp.bounds) {
-                            cell = 2 + ramp.direction;
+                    for ladder in &chunk.ladders {
+                        if cell_bounds.intersects(ladder) {
+                            cell = 6;
                             break;
                         }
                     }
 
-                    for object in chunk.objects.iter() {
-                        if cell_bounds.intersects(object) {
-                            cell = 1;
-                            break;
+                    if cell == 0 {
+                        for object in &chunk.objects {
+                            if cell_bounds.intersects(object) {
+                                cell = 1;
+                                break;
+                            }
+                        }
+                    }
+
+                    if cell == 0 {
+                        for ramp in &chunk.ramps {
+                            if cell_bounds.intersects(&ramp.bounds) {
+                                cell = 2 + ramp.direction;
+                                break;
+                            }
                         }
                     }
 
@@ -324,7 +351,7 @@ impl Map {
                 continue;
             }
 
-            walkable_grid[cell] = 1;
+            walkable_grid[cell] = if grid[cell] == 6 { 2 } else { 1 };
 
             if grid[cell] == 0 {
                 for neighbour in Self::horizontal_neighbours(&cell, &grid_size, false).iter() {
@@ -335,10 +362,12 @@ impl Map {
                         grid,
                     ) {
                         cells_to_see.push_back((neighbour.0, neighbour.1 + 1, neighbour.2));
-                    } else if Self::is_cell_walkable(
-                        &(neighbour.0, neighbour.1 - 1, neighbour.2),
-                        grid,
-                    ) {
+                    } else if neighbour.1 > 0
+                        && Self::is_cell_walkable(
+                            &(neighbour.0, neighbour.1 - 1, neighbour.2),
+                            grid,
+                        )
+                    {
                         cells_to_see.push_back((neighbour.0, neighbour.1 - 1, neighbour.2));
                     }
                 }
@@ -450,21 +479,21 @@ impl Map {
         let grid_size = (shape[0], shape[1], shape[2]);
 
         // check if the following checks are in bounds
-        if cell.0 + 1 >= grid_size.0
-            || cell.1 + PLAYER_HEIGHT > grid_size.1
-            || cell.2 + 1 >= grid_size.2
+        if (cell.0 == 0 || cell.0 + 1 >= grid_size.0)
+            || (cell.1 < 2 || cell.1 + PLAYER_HEIGHT > grid_size.1)
+            || (cell.2 == 0 || cell.2 + 1 >= grid_size.2)
         {
             return false;
         }
 
-        // check that cell and cells above are air or ramp
+        // check that cell and cells above are not filled
         for i in 0..(PLAYER_HEIGHT - 1) {
             if grid[(cell.0, cell.1 + i, cell.2)] == 1 {
                 return false;
             }
         }
 
-        // check that cell below is filled or ramp
+        // check that cell below is not air
         if grid[(cell.0, cell.1 - 1, cell.2)] == 0 {
             return false;
         }
@@ -485,8 +514,8 @@ impl Map {
                 }
             }
 
-            for neighbour in Self::horizontal_neighbours(cell, &grid_size, true) {
-                // check that surrounding cells are filled or ramp on the same height or one above or below
+            for neighbour in Self::horizontal_neighbours(cell, &grid_size, false) {
+                // check that surrounding cells on the same height or one above or below are not air
                 if grid[(neighbour.0, neighbour.1 - 2, neighbour.2)] == 0
                     && grid[(neighbour.0, neighbour.1 - 1, neighbour.2)] == 0
                     && grid[neighbour] == 0
@@ -494,11 +523,17 @@ impl Map {
                     return false;
                 }
 
-                // check that surrounding cells above are air or ramp
+                // check that surrounding cells above are not filled
                 if grid[(neighbour.0, neighbour.1 + 1, neighbour.2)] == 1 {
                     return false;
                 }
             }
+        } else if grid[*cell] == 6
+            && (grid[(cell.0 - 1, cell.1, cell.2)] != 6 || grid[(cell.0 + 1, cell.1, cell.2)] != 6)
+            && (grid[(cell.0, cell.1, cell.2 - 1)] != 6 || grid[(cell.0, cell.1, cell.2 + 1)] != 6)
+        {
+            // check that ladders have other ladder cells on both sides in either the x or z direction
+            return false;
         }
 
         true
@@ -552,7 +587,7 @@ impl Map {
                 Self::neighbours(cell, &grid_size, false)
                     .iter()
                     .filter_map(|c| {
-                        if self.walkable_grid[*c] > 0 {
+                        if self.walkable_grid[*c] == 1 {
                             for n in Self::horizontal_neighbours(c, &grid_size, true) {
                                 if self.walkable_grid[n] == 0
                                     && self.walkable_grid[(n.0, n.1 + 1, n.2)] == 0
@@ -563,6 +598,8 @@ impl Map {
                             }
 
                             Some((*c, if cell.1 == c.1 { 1 } else { 2 }))
+                        } else if self.walkable_grid[*c] == 2 {
+                            Some((*c, 3))
                         } else {
                             None
                         }
@@ -595,21 +632,23 @@ impl Map {
         let mut from_cell = path[0];
         let mut last_cell = path[1];
         'outer: for cell in &path[2..] {
-            for x in cell.0.min(from_cell.0)..cell.0.max(from_cell.0) + 1 {
-                for z in cell.2.min(from_cell.2)..cell.2.max(from_cell.2) + 1 {
-                    let mut found_filled = false;
-                    for y in cell.1.min(from_cell.1)..cell.1.max(from_cell.1) + 1 {
-                        if self.walkable_grid[(x, y, z)] > 0 {
-                            found_filled = true;
-                            break;
+            if cell.0 != last_cell.0 || cell.2 != last_cell.2 {
+                for x in cell.0.min(from_cell.0) - 1..cell.0.max(from_cell.0) + 2 {
+                    for z in cell.2.min(from_cell.2) - 1..cell.2.max(from_cell.2) + 2 {
+                        let mut found_filled = false;
+                        for y in cell.1.min(from_cell.1)..cell.1.max(from_cell.1) + 1 {
+                            if self.walkable_grid[(x, y, z)] > 0 {
+                                found_filled = true;
+                                break;
+                            }
                         }
-                    }
 
-                    if !found_filled {
-                        simplified_path.push(last_cell);
-                        from_cell = last_cell;
-                        last_cell = *cell;
-                        continue 'outer;
+                        if !found_filled {
+                            simplified_path.push(last_cell);
+                            from_cell = last_cell;
+                            last_cell = *cell;
+                            continue 'outer;
+                        }
                     }
                 }
             }

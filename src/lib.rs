@@ -81,6 +81,7 @@ impl Client {
 
         let source = source?;
 
+        // Get the version specific prime number used for message encoding from the source code
         let prime = Regex::new(r"JSON\.parse\('(\d+)'\)")?
             .captures(&source)
             .ok_or("Could not extract prime number from source code")?
@@ -97,6 +98,7 @@ impl Client {
     }
 
     async fn load_maps(source: &str) -> Result<Vec<Map>, Error> {
+        // Get the json map data from the source code and deserialize them into RawMaps
         let maps = Regex::new(r#"\{"name":"[^"]+",[^']+"#)?
             .find_iter(source)
             .skip(1)
@@ -117,6 +119,7 @@ impl Client {
 
         info!("Parsing {} maps...", maps.len());
 
+        // Spawn a task for parsing each map
         let tasks = maps
             .into_iter()
             .map(|map| {
@@ -125,6 +128,7 @@ impl Client {
             })
             .collect::<Result<Vec<_>, Error>>()?;
 
+        // Block until all maps are parsed
         try_join_all(tasks)
             .await?
             .into_iter()
@@ -191,6 +195,29 @@ pub struct GameConnectInfo {
 }
 
 impl Game {
+    pub async fn from_id(client: &Client, id: &str) -> Result<Self, Error> {
+        let req_client = reqwest::Client::new();
+        let raw_game: RawGame = req_client
+            .get("https://matchmaker.krunker.io/game-info")
+            .query(&[("game", id)])
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        Ok(Self {
+            client_key: client.client_key.clone(),
+            id: raw_game.0,
+            region: raw_game.1,
+            players: raw_game.2,
+            max_players: raw_game.3,
+            custom: raw_game.4.custom != 0,
+            version: raw_game.4.version,
+            map: raw_game.4.map,
+            mode: raw_game.4.mode,
+        })
+    }
+
     pub async fn validation_token(&self) -> Result<String, Error> {
         let req_client = reqwest::Client::new();
 

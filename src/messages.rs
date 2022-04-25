@@ -197,4 +197,12 @@ impl MessageParser {
             Err("Wrong Message Type".into())
         }
     }
+
+    pub fn error(msg: &[Value]) -> String {
+        msg.first()
+            .unwrap_or(&Value::String(String::from("")))
+            .as_str()
+            .unwrap_or("")
+            .to_owned()
+    }
 }

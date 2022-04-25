@@ -342,6 +342,8 @@ impl Map {
                 .collect::<Vec<_>>(),
         );
 
+        // Look at the surrounding cells of the cells in the queue and check if they are walkable.
+        // If they are, add them to the queue too. If the queue is empty every walkable cell has been found.
         while let Some(cell) = cells_to_see.pop_front() {
             if cell.0 >= grid_size.0 || cell.1 >= grid_size.1 || cell.2 >= grid_size.2 {
                 return Err("Cell index out of bounds".into());
@@ -351,8 +353,11 @@ impl Map {
                 continue;
             }
 
+            // Differentiate between ladder and other cells for pathfinding
             walkable_grid[cell] = if grid[cell] == 6 { 2 } else { 1 };
 
+            // For air cells, only consider the 4 horizontal neighbours on the same level and y +- 1.
+            // For ramp and ladder cells, check all neighbours including edges.
             if grid[cell] == 0 {
                 for neighbour in Self::horizontal_neighbours(&cell, &grid_size, false).iter() {
                     if Self::is_cell_walkable(neighbour, grid) {
@@ -424,6 +429,7 @@ impl Map {
             ]);
         }
 
+        // only include cells that are in bounds
         neighbours
             .iter()
             .filter_map(|(x, y, z)| {
@@ -462,6 +468,7 @@ impl Map {
             ]);
         }
 
+        // only include cells that are in bounds
         neighbours
             .iter()
             .filter_map(|(x, y, z)| {
@@ -555,22 +562,25 @@ impl Map {
         let shape = self.walkable_grid.shape();
         let grid_size = (shape[0], shape[1], shape[2]);
 
-        let exact_cell = position_to_cell(&self.bounds, position);
-        let mut cells = Vec::<(usize, usize, usize)>::new();
+        let cell = position_to_cell(&self.bounds, position);
 
-        for y in 0..grid_size.1 {
-            if self.walkable_grid[(exact_cell.0, y, exact_cell.2)] != 0 {
-                cells.push((exact_cell.0, y, exact_cell.2));
+        let mut cells = vec![cell];
+        cells.append(&mut Self::horizontal_neighbours(&cell, &grid_size, true));
+
+        for cell in cells {
+            for offset in 0..(PLAYER_HEIGHT * 2.0 as usize) {
+                if cell.1 + offset < grid_size.1
+                    && self.walkable_grid[(cell.0, cell.1 + offset, cell.2)] != 0
+                {
+                    return Some((cell.0, cell.1 + offset, cell.2));
+                }
+                if cell.1 >= offset && self.walkable_grid[(cell.0, cell.1 - offset, cell.2)] != 0 {
+                    return Some((cell.0, cell.1 - offset, cell.2));
+                }
             }
         }
 
-        cells.sort_by(|a, b| {
-            (a.1 as isize - exact_cell.1 as isize)
-                .abs()
-                .cmp(&(b.1 as isize - exact_cell.1 as isize).abs())
-        });
-
-        cells.get(0).cloned()
+        None
     }
 
     pub fn find_path(
@@ -581,40 +591,46 @@ impl Map {
         let shape = self.walkable_grid.shape();
         let grid_size = (shape[0], shape[1], shape[2]);
 
-        let path = astar(
-            start_cell,
-            |cell| {
-                Self::neighbours(cell, &grid_size, false)
-                    .iter()
-                    .filter_map(|c| {
-                        if self.walkable_grid[*c] == 1 {
-                            for n in Self::horizontal_neighbours(c, &grid_size, true) {
-                                if self.walkable_grid[n] == 0
-                                    && self.walkable_grid[(n.0, n.1 + 1, n.2)] == 0
-                                    && self.walkable_grid[(n.0, n.1 - 1, n.2)] == 0
-                                {
-                                    return Some((*c, 3));
-                                }
+        // Calculate the successors of a cell, giving them different cost based on their failure potential.
+        // Cells surrounded by other walkable cells get a cost of 1.
+        // Cells on the edge of the walkable grid get a cost of 2 as it is easier for the player to walk off/against something.
+        // Ladder cells get a cost of 3 as the chance of the player failing to walk up is highest
+        let successors = |cell: &(usize, usize, usize)| -> Vec<((usize, usize, usize), i32)> {
+            Self::neighbours(cell, &grid_size, false)
+                .iter()
+                .filter_map(|c| {
+                    if self.walkable_grid[*c] == 1 {
+                        for n in Self::horizontal_neighbours(c, &grid_size, true) {
+                            if self.walkable_grid[n] == 0
+                                && self.walkable_grid[(n.0, n.1 + 1, n.2)] == 0
+                                && self.walkable_grid[(n.0, n.1 - 1, n.2)] == 0
+                            {
+                                return Some((*c, 3));
                             }
-
-                            Some((*c, if cell.1 == c.1 { 1 } else { 2 }))
-                        } else if self.walkable_grid[*c] == 2 {
-                            Some((*c, 3))
-                        } else {
-                            None
                         }
-                    })
-                    .collect::<Vec<_>>()
-            },
-            |cell| {
-                ((cell.0 as f32 - end_cell.0 as f32).powi(2)
-                    + (cell.1 as f32 - end_cell.1 as f32).powi(2)
-                    + (cell.2 as f32 - end_cell.2 as f32).powi(2))
-                .sqrt()
-                .floor() as u32
-            },
-            |cell| *cell == *end_cell,
-        );
+
+                        Some((*c, if cell.1 == c.1 { 1 } else { 2 }))
+                    } else if self.walkable_grid[*c] == 2 {
+                        Some((*c, 3))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Simple function that calculates the direct distance from the cell to the end cell
+        let heuristic = |cell: &(usize, usize, usize)| {
+            ((cell.0 as f32 - end_cell.0 as f32).powi(2)
+                + (cell.1 as f32 - end_cell.1 as f32).powi(2)
+                + (cell.2 as f32 - end_cell.2 as f32).powi(2))
+            .sqrt()
+            .floor() as i32
+        };
+
+        let success = |cell: &(usize, usize, usize)| *cell == *end_cell;
+
+        let path = astar(start_cell, successors, heuristic, success);
 
         if let Some((path, _)) = path {
             Some(self.simplify_path(&path))
@@ -628,6 +644,10 @@ impl Map {
             return Vec::from(path);
         }
 
+        // Simplify the path by checking if the direct path between two cells is walkable.
+        // If it is, try the next cell until one is found that doesn't have a direct walkable path.
+        // In that case add the previous cell to the simplified path and repeat the process starting from that cell.
+        // This eliminates a lot of unnecessary cells and allows the player to walk diagonal.
         let mut simplified_path = Vec::from([path[0]]);
         let mut from_cell = path[0];
         let mut last_cell = path[1];

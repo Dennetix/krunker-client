@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, f32::consts::PI, sync::Arc, time::Duration};
 
 use tokio::{sync::Mutex, time};
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::{
     map::Map,
@@ -83,8 +83,8 @@ impl PlayerBuilder {
 }
 
 const MOVEMENT_SPEED: f32 = 0.0000459;
-const WALK_TO_DISTANCE_XZ_THRESHOLD: f32 = 2.6;
-const WALK_TO_DISTANCE_Y_THRESHOLD: f32 = 8.25;
+const WALK_TO_DISTANCE_XZ_THRESHOLD: f32 = 2.2;
+const WALK_TO_DISTANCE_Y_THRESHOLD: f32 = 8.3;
 
 pub struct Player {
     client: Arc<Mutex<Client>>,
@@ -413,6 +413,9 @@ impl Player {
             "end" => {
                 self.in_game = false;
             }
+            // server error
+            "error" => return Err(format!("Sever error: {}", MessageParser::error(&msg)).into()),
+            "cap" => info!("Wants captcha"),
             _ => (),
         }
 
